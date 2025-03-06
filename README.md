@@ -5,6 +5,8 @@ Plotting results from halla_molpol_sim scans.
 python3 MolPolScans.py 
 
 ### Execution Flags/Arguments
+| Flag | Description |
+|------|-------------|
 | --file | file to read [CSV with additional metadata line] |
 | --energy | beam energy [in GeV] |
 | --magnet | specify scan magnet [1-5] |
