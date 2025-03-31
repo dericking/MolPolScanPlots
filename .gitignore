@@ -6,3 +6,7 @@
 # Prerequisites
 kg2a/*.d
 kg2a/*.so
+
+# Allow .csv and .pdf files in a specific directory (e.g., `allowed_dir/`)
+!sampleData/*.csv
+!sampleOutput/*.pdf

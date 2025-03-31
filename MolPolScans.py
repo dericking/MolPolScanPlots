@@ -4,24 +4,22 @@
 #                                                                                                 #
 # python3 MolPolScans.py --file sbs5passDipoleNew.csv --energy 10.7 --magnet 5 --setpoint 1.275   #
 # --file: file to read                                                                            #
-# --energy: beam energy (TODO: Change to fetch from metadata line)                                #
 # --magnet: specify scan magnet                                                                   #
 # --setpoint: (optional) adds set point to plot and table outputs                                 #
+# --preserve: points to preserve give in pole tip values                                          #
 ###################################################################################################
 import argparse
-import sys
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 
-from scipy.interpolate import CubicSpline, interp1d, UnivariateSpline
+from scipy.interpolate import CubicSpline, interp1d
 from scipy.signal import savgol_filter
 from scipy.stats import chi2
 
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.preprocessing import MinMaxScaler
-from scipy.stats import chi2
 
 from PyPDF2 import PdfMerger
 from fpdf import FPDF
@@ -31,20 +29,18 @@ from datetime import datetime
 parser = argparse.ArgumentParser(description="MolPol Simulation Scan Processing")
 parser.add_argument("--file", type=str, required=True, help="Path to the CSV file")
 parser.add_argument("--magnet", type=int, required=True, choices=range(1, 7), help="Magnet number (1-6)")
-parser.add_argument("--energy", type=str, required=True, help="Energy value")
 parser.add_argument("--setpoint", type=float, required=False, default=None, help="Tune Selection [Pole Tip]")
-
+parser.add_argument("--preserve", type=float, nargs='*', default=[], help="List of points to preserve")
 # Parse arguments
 args = parser.parse_args()
 
 flname = args.file
-energy = args.energy
 magnet = args.magnet
 setpnt = args.setpoint
+preserve_points = args.preserve
 
 print(f'Filename: {flname}')
 print(f'Scan Mag: {magnet}')
-print(f'  Energy: {energy}')
 print(f'SetPoint: {setpnt if setpnt is not None else "None"}')
 
 # Validate magnet input
@@ -60,7 +56,12 @@ for item in first_line.split(','):
     if '=' in item:
         key, value = item.split('=')
         metadata[key.strip()] = value.strip()
-        
+
+# Derive energy from metadata (using the 'beamE' key)
+energy = metadata.get('beamE', 'Unknown Energy')
+
+print(f'  Energy: {energy}')
+
 # MolPol magnet names
 magnet_map = {
     1: "Quad1",
@@ -163,56 +164,80 @@ def iterative_smoothing(measurement_points, measurement_values, convergence_thre
         iteration += 1
     return measurement_fit, iteration
 
-def gpr_smoothing(measurement_points, measurement_values, measurement_errors, length_scale=0.9):
-    """
-    Applies Gaussian Process Regression (GPR) smoothing to a dataset.
 
-    Parameters:
-    measurement_points (numpy array): The x-values of the dataset.
-    measurement_values (numpy array): The original measured y-values.
-    measurement_errors (numpy array): The measurement uncertainties.
-    length_scale (float): The length scale for the RBF kernel (default: 0.1).
-    
-    Returns:
-    pd.DataFrame: A DataFrame containing the original and smoothed data.
-    """
+def iterative_gpr_smoothing(measurement_points, measurement_values, measurement_errors,
+                            length_scale=10.0, initial_noise_level=0.000001, max_iter=100,
+                            initial_error_scaling=1.0, initial_nu=5, nu_step=0.25, nu_min=0.05,
+                            preserve_points=None):
+    import numpy as np
+    from sklearn.gaussian_process import GaussianProcessRegressor
+    from sklearn.gaussian_process.kernels import Matern, WhiteKernel, ConstantKernel as C
+    from sklearn.preprocessing import MinMaxScaler
+    from scipy.stats import chi2
+    import warnings
+    from sklearn.exceptions import ConvergenceWarning
+
+    measurement_points = np.array(measurement_points)
+    measurement_values = np.array(measurement_values)
+    measurement_errors = np.array(measurement_errors)
     scaler = MinMaxScaler()
     measurement_points_scaled = scaler.fit_transform(measurement_points.reshape(-1, 1))
+    safe_errors = np.maximum(measurement_errors, 1e-6)
+    current_nu = initial_nu
+    if preserve_points is None:
+        preserve_points = []
 
-    # Define the Gaussian Process kernel (constant + RBF for smoothness)
-    kernel = C(1.0) * RBF(length_scale=length_scale)
-
-    # Initialize and fit the Gaussian Process Regressor
-    gpr = GaussianProcessRegressor(kernel=kernel, alpha=(0.5 * measurement_errors) ** 2, n_restarts_optimizer=10)
-    #gpr.fit(measurement_points.reshape(-1, 1), measurement_values)
-    gpr.fit(measurement_points_scaled.reshape(-1, 1), measurement_values)
-
-    # Predict the smoothed values at the original measurement points
-    # smoothed_values, sigma = gpr.predict(measurement_points.reshape(-1, 1), return_std=True)
-    smoothed_values, sigma = gpr.predict(measurement_points_scaled.reshape(-1, 1), return_std=True)
-
-    # Compute chi-squared statistic and p-value
-    chi2_stat = np.sum(((smoothed_values - measurement_values) / measurement_errors) ** 2)
+    for i in range(max_iter):
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=ConvergenceWarning)
+            kernel = (C(1.0, (1e-4, 1e3)) *
+                      Matern(length_scale=length_scale, nu=current_nu,
+                             length_scale_bounds=(1e-4, 1e3))
+                      + WhiteKernel(noise_level=initial_noise_level,
+                                    noise_level_bounds=(1e-6, 1e1)))
+            gpr = GaussianProcessRegressor(kernel=kernel,
+                                           alpha=(initial_error_scaling * safe_errors)**2,
+                                           n_restarts_optimizer=10)
+            gpr.fit(measurement_points_scaled, measurement_values)
+        smoothed_values, _ = gpr.predict(measurement_points_scaled, return_std=True)
+        # Force preserved points to match their measured value exactly
+        for j in range(len(measurement_values)):
+            if any(abs(measurement_points[j] - p) < 1e-8 for p in preserve_points):
+                smoothed_values[j] = measurement_values[j]
+        deviations = np.abs(measurement_values - smoothed_values) / measurement_errors
+        fraction_within_1sigma = np.mean(deviations < 1)
+        fraction_above_2sigma = np.sum(deviations > 2) / len(measurement_values)
+        dof = len(measurement_values) - 1
+        print(f"It {i+1}: nu = {current_nu:.4f}, nu_step = {nu_step:.4f}, <1σ = {fraction_within_1sigma*100:.1f}%, >2σ = {fraction_above_2sigma*100:.1f}%, Chi^2/NDF = {np.sum(((smoothed_values - measurement_values) / safe_errors)**2)/dof:.4f}")
+        if fraction_within_1sigma >= 0.7:
+            current_nu += nu_step / 1.05
+        elif fraction_within_1sigma <= 0.60:
+            nu_step = nu_step / 1.05
+            current_nu -= nu_step
+        elif fraction_above_2sigma > 0.075:
+            nu_step = nu_step / 1.05
+            current_nu -= nu_step
+        else:
+            chi2_stat = np.sum(((smoothed_values - measurement_values) / safe_errors)**2)
+            dof = len(measurement_values) - 1
+            p_value = 1 - chi2.cdf(chi2_stat, dof)
+            print("Acceptable fit found.")
+            print(f"  Chi^2 = {chi2_stat:.4f}, p-value = {p_value:.4f}, Chi^2/NDF = {chi2_stat/dof:.4f}")
+            return smoothed_values, p_value
+    chi2_stat = np.sum(((smoothed_values - measurement_values) / safe_errors)**2)
     dof = len(measurement_values) - 1
     p_value = 1 - chi2.cdf(chi2_stat, dof)
-
-    # Store results in a DataFrame
-    df_results = pd.DataFrame({
-        "MeasurementPoint": measurement_points,
-        "OriginalMeasurementValue": measurement_values,
-        "SmoothedMeasurementValue": smoothed_values,
-        "OriginalError": measurement_errors,
-        "GPRUncertainty": sigma
-    })
-
-    return df_results["SmoothedMeasurementValue"], p_value
-    #return pd.DataFrame(smoothed_values, index=measurement_points), p_value
-
+    print(f"Max iterations reached. Final Chi^2/NDF = {chi2_stat/dof:.4f}")
+    return smoothed_values, p_value
 
 # Create a smoothed curve with some NN averaging -- decided to weight overall error (error bars on smoothed curve are thus slightly smaller)
 for label in ['Coin', 'Left', 'Rght']:
-    df[f'{label}CorAzzSmooth'], _ = iterative_smoothing(df['MagPoleTip'].values, df[f'{label}CorAzz'].values)
-    #df[f'{label}CorAzzSmooth'], _ = gpr_smoothing(df['MagPoleTip'].values, df[f'{label}CorAzz'].values, df[f'{label}CorErr'].values)
+    print(f"\nStarting fit for {label} data")
+    df[f'{label}CorAzzSmooth'], _ = iterative_gpr_smoothing(df['MagPoleTip'].values,
+                                                              df[f'{label}CorAzz'].values,
+                                                              df[f'{label}CorErr'].values,
+                                                              preserve_points=preserve_points)
+
 
 # Check if setpnt exists in MagPoleTip column -- if it does then we only want to highlight this row, else we will have to insert and interpolate
 if setpnt is not None:
@@ -343,7 +368,7 @@ def plot_with_error_test(ax1, ax2, df, ylabel, title, setpnt=None):
     cs = CubicSpline(x, norm_rt)
     ax2.plot(x_smooth, cs(x_smooth), color='darkslategray', linestyle='solid', linewidth=1.0, label=f'{ylabel} Norm Rate')
     ax2.scatter(x, norm_rt, color='darkslategray', marker='.', s=20)
-    ax2.scatter(rate_max_positions[ylabel], rate_max_values[ylabel], color='yellow', edgecolors='darkslategray', 
+    ax2.scatter(rate_max_positions[ylabel], rate_max_values[ylabel], color='magenta', edgecolors='darkslategray', 
                 marker="v", s=40, linewidth=0.5, zorder=3, label=f'{ylabel} Rate Max')
 
     if setpnt is not None:
@@ -352,9 +377,9 @@ def plot_with_error_test(ax1, ax2, df, ylabel, title, setpnt=None):
         setpnt_norm_rt = df[f'{ylabel}NormRt'][df['MagPoleTip'] == setpnt].values[0]
         # Add the vertical dashed line at the correct setpoint MagCurrent position
         ax1.axvline(x=setpnt_value, color='red', linestyle='solid', linewidth=0.5, label='Tune Set Value')
-        ax1.scatter(setpnt_value, setpnt_cor_azz_smooth, color='darkorange', edgecolors='black',
+        ax1.scatter(setpnt_value, setpnt_cor_azz_smooth, color='red', edgecolors='black',
                     marker='*', s=90, linewidth=0.5, zorder=5)
-        ax2.scatter(setpnt_value, setpnt_norm_rt, color='yellow', edgecolors='black',
+        ax2.scatter(setpnt_value, setpnt_norm_rt, color='red', edgecolors='black',
                     marker='*', s=90, linewidth=0.5, zorder=5)
         # Draw lines and add text labels for azz and rate set values on axes
         ax1.hlines(setpnt_cor_azz_smooth, x_min, setpnt_value, linestyle='solid', colors='darkorange', linestyles='solid', linewidth=0.5)
